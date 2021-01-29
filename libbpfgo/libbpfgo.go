@@ -88,6 +88,48 @@ int remove_kprobe_event(const char* func_name, bool is_kretprobe) {
     return poke_kprobe_events(false, func_name, is_kretprobe);
 }
 
+// https://www.kernel.org/doc/Documentation/trace/uprobetracer.rst
+int poke_uprobe_events(bool add, const char* name, bool ret) {
+    char buf[256];
+    int fd, err;
+    char pr;
+
+    fd = open("/sys/kernel/debug/tracing/uprobe_events", O_WRONLY | O_APPEND, 0);
+    if (fd < 0) {
+        err = -errno;
+        fprintf(stderr, "failed to open uprobe_events file: %d\n", err);
+        return err;
+    }
+
+    pr = ret ? 'r' : 'p';
+
+    if (add)
+        snprintf(buf, sizeof(buf), "%c:uprobes/%c%s %s", pr, pr, name, name);
+    else
+        snprintf(buf, sizeof(buf), "-:uprobes/%c%s", pr, name);
+
+    err = write(fd, buf, strlen(buf));
+    if (err < 0) {
+        err = -errno;
+        fprintf(
+            stderr,
+            "failed to %s uprobe '%s': %d\n",
+            add ? "add" : "remove",
+            buf,
+            err);
+    }
+    close(fd);
+    return err >= 0 ? 0 : err;
+}
+
+int add_uprobe_event(const char* path_colon_offset, bool is_uretprobe) {
+    return poke_uprobe_events(true, path_colon_offset, is_uretprobe);
+}
+
+int remove_uprobe_event(const char* path_colon_offset, bool is_uretprobe) {
+    return poke_uprobe_events(false, path_colon_offset, is_uretprobe);
+}
+
 struct bpf_link* attach_kprobe_legacy(
     struct bpf_program* prog,
     const char* func_name,
@@ -199,6 +241,8 @@ const (
 	Kretprobe
 	KprobeLegacy
 	KretprobeLegacy
+	Uprobe
+	Uretprobe
 )
 
 type BPFLink struct {
@@ -274,6 +318,16 @@ func (m *Module) Close() {
 		if link.linkType == KretprobeLegacy {
 			cs := C.CString(link.eventName)
 			C.remove_kprobe_event(cs, true)
+			C.free(unsafe.Pointer(cs))
+		}
+		if link.linkType == Uprobe {
+			cs := C.CString(link.eventName)
+			C.remove_uprobe_event(cs, false)
+			C.free(unsafe.Pointer(cs))
+		}
+		if link.linkType == Uretprobe {
+			cs := C.CString(link.eventName)
+			C.remove_uprobe_event(cs, true)
 			C.free(unsafe.Pointer(cs))
 		}
 	}
@@ -526,6 +580,35 @@ func (p *BPFProg) AttachRawTracepoint(tpEvent string) (*BPFLink, error) {
 		eventName: tpEvent,
 	}
 	p.module.links = append(p.module.links, bpfLink)
+	return bpfLink, nil
+}
+
+func (p *BPFProg) AttachUprobe(up string, offset int) (*BPFLink, error) {
+	return doAttachUprobe(p, up, offset, false)
+}
+
+func doAttachUprobe(prog *BPFProg, path string, offset int, isUretprobe bool) (*BPFLink, error) {
+	cs := C.CString(path)
+	co := C.size_t(offset)
+	cbool := C.bool(isUretprobe)
+	link := C.bpf_program__attach_uprobe(prog.prog, cbool, cs, co)
+	C.free(unsafe.Pointer(cs))
+	if link == nil {
+		return nil, fmt.Errorf("failed to attach %s u(ret)probe to program %s", path, prog.name)
+	}
+
+	upType := Uprobe
+	if isUretprobe {
+		upType = Uretprobe
+	}
+
+	bpfLink := &BPFLink{
+		link:      link,
+		prog:      prog,
+		linkType:  upType,
+		eventName: fmt.Sprintf("%s:%d", path, offset),
+	}
+	prog.module.links = append(prog.module.links, bpfLink)
 	return bpfLink, nil
 }
 
